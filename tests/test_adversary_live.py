@@ -1,0 +1,641 @@
+"""
+Adversary exhaustive unit tests for live transcription components.
+Tests edge cases, error paths, and contract violations that go beyond
+the builder's happy-path coverage.
+"""
+import sys
+import time
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+
+from whisper_notes.config import Config, ConfigError
+from whisper_notes.live_recorder import LiveRecorder, LiveRecordingError
+from whisper_notes.live_transcriber import (
+    LiveTranscriber,
+    LiveTranscriberThread,
+    LiveTranscriptionError,
+)
+
+SAMPLE_RATE = 16000
+
+
+# ============================================================
+# Fixtures
+# ============================================================
+
+
+@pytest.fixture
+def mock_faster_whisper():
+    with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:
+        mock_instance = MagicMock()
+        MockModel.return_value = mock_instance
+        yield MockModel, mock_instance
+
+
+@pytest.fixture
+def mock_sd():
+    with patch("whisper_notes.live_recorder.sd") as mock:
+        yield mock
+
+
+@pytest.fixture
+def mock_tk():
+    """Mock tkinter entirely -- it can't run headless."""
+    tk_mock = MagicMock()
+    scrolledtext_mock = MagicMock()
+    with patch.dict(
+        "sys.modules", {"tkinter": tk_mock, "tkinter.scrolledtext": scrolledtext_mock}
+    ):
+        if "whisper_notes.live_window" in sys.modules:
+            del sys.modules["whisper_notes.live_window"]
+        import whisper_notes.live_window as lw
+
+        yield lw, tk_mock
+
+
+def make_chunk(seconds=3, sample_rate=SAMPLE_RATE):
+    return np.zeros(int(seconds * sample_rate), dtype=np.float32)
+
+
+# ============================================================
+# Config edge cases (AC-1.1 through AC-1.7)
+# ============================================================
+
+
+class TestConfigLiveFields:
+    def test_live_chunk_seconds_default(self):
+        """AC-1.1"""
+        cfg = Config()
+        assert cfg.live_chunk_seconds == 3
+
+    def test_faster_whisper_model_default(self):
+        """AC-1.2"""
+        cfg = Config()
+        assert cfg.faster_whisper_model == "base"
+
+    def test_live_chunk_seconds_float_string_raises(self, monkeypatch):
+        """AC-1.3: LIVE_CHUNK_SECONDS='3.5' must raise ConfigError because int('3.5') fails."""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "3.5")
+        with pytest.raises(ConfigError, match="LIVE_CHUNK_SECONDS"):
+            Config()
+
+    def test_live_chunk_seconds_non_numeric_raises(self, monkeypatch):
+        """AC-1.4"""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "nope")
+        with pytest.raises(ConfigError, match="must be an integer"):
+            Config()
+
+    def test_live_chunk_seconds_zero_raises(self, monkeypatch):
+        """AC-1.5"""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "0")
+        with pytest.raises(ConfigError, match="must be >= 1"):
+            Config()
+
+    def test_live_chunk_seconds_negative_raises(self, monkeypatch):
+        """LIVE_CHUNK_SECONDS=-1 must raise ConfigError."""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "-1")
+        with pytest.raises(ConfigError, match="must be >= 1"):
+            Config()
+
+    def test_live_chunk_seconds_override(self, monkeypatch):
+        """AC-1.6"""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "5")
+        cfg = Config()
+        assert cfg.live_chunk_seconds == 5
+
+    def test_faster_whisper_model_override(self, monkeypatch):
+        """AC-1.7"""
+        monkeypatch.setenv("FASTER_WHISPER_MODEL", "small")
+        cfg = Config()
+        assert cfg.faster_whisper_model == "small"
+
+    def test_live_chunk_seconds_empty_string_raises(self, monkeypatch):
+        """Empty string is not a valid integer."""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "")
+        with pytest.raises(ConfigError, match="LIVE_CHUNK_SECONDS"):
+            Config()
+
+    def test_live_chunk_seconds_whitespace_raises(self, monkeypatch):
+        """Whitespace-only string is not a valid integer."""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "  ")
+        with pytest.raises(ConfigError, match="LIVE_CHUNK_SECONDS"):
+            Config()
+
+    def test_live_chunk_seconds_large_value_accepted(self, monkeypatch):
+        """Large values are accepted (no upper bound in spec)."""
+        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "999")
+        cfg = Config()
+        assert cfg.live_chunk_seconds == 999
+
+
+# ============================================================
+# LiveTranscriber edge cases (AC-2.1 through AC-2.5)
+# ============================================================
+
+
+class TestLiveTranscriber:
+    def test_empty_segments_returns_empty_string(self, mock_faster_whisper):
+        """AC-2.1"""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        assert t.transcribe_chunk(make_chunk()) == ""
+
+    def test_single_segment_stripped(self, mock_faster_whisper):
+        """AC-2.2"""
+        _, mock_instance = mock_faster_whisper
+        seg = MagicMock()
+        seg.text = " Hello from faster-whisper"
+        mock_instance.transcribe.return_value = ([seg], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        assert t.transcribe_chunk(make_chunk()) == "Hello from faster-whisper"
+
+    def test_multiple_segments_concatenated(self, mock_faster_whisper):
+        """AC-2.3"""
+        _, mock_instance = mock_faster_whisper
+        seg1, seg2 = MagicMock(), MagicMock()
+        seg1.text = " First"
+        seg2.text = " second"
+        mock_instance.transcribe.return_value = ([seg1, seg2], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        assert t.transcribe_chunk(make_chunk()) == "First second"
+
+    def test_model_loaded_exactly_once(self, mock_faster_whisper):
+        """AC-2.4"""
+        MockModel, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        t.transcribe_chunk(make_chunk())
+        t.transcribe_chunk(make_chunk())
+        t.transcribe_chunk(make_chunk())
+        MockModel.assert_called_once_with("base", device="cpu", compute_type="int8")
+
+    def test_exception_wraps_in_live_transcription_error(self, mock_faster_whisper):
+        """AC-2.5"""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.side_effect = RuntimeError("model crash")
+        t = LiveTranscriber(model_name="base")
+        with pytest.raises(LiveTranscriptionError, match="model crash"):
+            t.transcribe_chunk(make_chunk())
+
+    def test_empty_audio_array_zero_samples(self, mock_faster_whisper):
+        """Empty audio (0 samples) should still work -- transcribe is called."""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        result = t.transcribe_chunk(np.array([], dtype=np.float32))
+        assert result == ""
+
+    def test_segment_with_only_whitespace_text(self, mock_faster_whisper):
+        """Segment with only whitespace should result in empty string after strip."""
+        _, mock_instance = mock_faster_whisper
+        seg = MagicMock()
+        seg.text = "   "
+        mock_instance.transcribe.return_value = ([seg], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        assert t.transcribe_chunk(make_chunk()) == ""
+
+    def test_segment_with_unicode_text(self, mock_faster_whisper):
+        """Unicode text should pass through correctly."""
+        _, mock_instance = mock_faster_whisper
+        seg = MagicMock()
+        seg.text = " Hola mundo"
+        mock_instance.transcribe.return_value = ([seg], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        assert t.transcribe_chunk(make_chunk()) == "Hola mundo"
+
+    def test_transcribe_chunk_passes_language_none(self, mock_faster_whisper):
+        """Spec says: model.transcribe(audio, language=None)."""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        chunk = make_chunk()
+        t.transcribe_chunk(chunk)
+        _, kwargs = mock_instance.transcribe.call_args
+        assert kwargs.get("language") is None
+
+    def test_error_preserves_original_exception_as_cause(self, mock_faster_whisper):
+        """The original exception should be chained via 'from e'."""
+        _, mock_instance = mock_faster_whisper
+        original = RuntimeError("gpu oom")
+        mock_instance.transcribe.side_effect = original
+        t = LiveTranscriber(model_name="base")
+        with pytest.raises(LiveTranscriptionError) as exc_info:
+            t.transcribe_chunk(make_chunk())
+        assert exc_info.value.__cause__ is original
+
+
+# ============================================================
+# LiveTranscriberThread edge cases (AC-3.1 through AC-3.3)
+# ============================================================
+
+
+class TestLiveTranscriberThread:
+    def test_on_text_called_for_full_chunk(self, mock_faster_whisper):
+        """AC-3.1: Feed 1 second of audio with chunk_seconds=1 -> on_text called."""
+        _, mock_instance = mock_faster_whisper
+        seg = MagicMock()
+        seg.text = "hello"
+        mock_instance.transcribe.return_value = ([seg], MagicMock())
+
+        received = []
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=received.append
+        )
+        thread.start()
+        thread.feed(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        time.sleep(0.5)
+        thread.stop()
+        thread.join(timeout=2)
+        assert len(received) >= 1
+
+    def test_stops_cleanly(self, mock_faster_whisper):
+        """AC-3.2"""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=3, sample_rate=SAMPLE_RATE, on_text=lambda x: None
+        )
+        thread.start()
+        thread.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    def test_remaining_buffer_transcribed_on_stop(self, mock_faster_whisper):
+        """AC-3.3: Feed less than chunk_seconds, stop -> remaining buffer transcribed."""
+        _, mock_instance = mock_faster_whisper
+        seg = MagicMock()
+        seg.text = "partial"
+        mock_instance.transcribe.return_value = ([seg], MagicMock())
+
+        received = []
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=received.append
+        )
+        thread.start()
+        # Feed 0.5 seconds (8000 samples < 16000 needed)
+        thread.feed(np.zeros(8000, dtype=np.float32))
+        time.sleep(0.2)
+        thread.stop()
+        thread.join(timeout=2)
+        assert len(received) >= 1
+        assert "partial" in received[0]
+
+    def test_thread_stopped_before_any_audio_joins_cleanly(self, mock_faster_whisper):
+        """Stop immediately without feeding any audio -- should join cleanly."""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=lambda x: None
+        )
+        thread.start()
+        thread.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        # transcribe should NOT have been called (no audio fed)
+        mock_instance.transcribe.assert_not_called()
+
+    def test_multiple_stop_calls_no_error(self, mock_faster_whisper):
+        """Multiple stop() calls should not raise."""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=lambda x: None
+        )
+        thread.start()
+        thread.stop()
+        thread.stop()  # second stop should not raise
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    def test_transcription_error_during_chunk_skipped(self, mock_faster_whisper):
+        """faster-whisper raises mid-stream -> thread continues, skips chunk."""
+        _, mock_instance = mock_faster_whisper
+        call_count = [0]
+
+        def fake_transcribe(audio, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("transient error")
+            seg = MagicMock()
+            seg.text = "recovered"
+            return [seg], MagicMock()
+
+        mock_instance.transcribe.side_effect = fake_transcribe
+
+        received = []
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=received.append
+        )
+        thread.start()
+        # Feed 2 full chunks
+        thread.feed(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        thread.feed(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        time.sleep(0.5)
+        thread.stop()
+        thread.join(timeout=2)
+        # First chunk errored, second should have succeeded
+        assert any("recovered" in r for r in received)
+
+    def test_transcription_error_on_remaining_buffer_swallowed(self, mock_faster_whisper):
+        """Error on remaining buffer at stop is silently swallowed."""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.side_effect = RuntimeError("oom")
+
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=lambda x: None
+        )
+        thread.start()
+        thread.feed(np.zeros(8000, dtype=np.float32))  # partial chunk
+        time.sleep(0.2)
+        thread.stop()
+        thread.join(timeout=2)
+        # Thread should exit cleanly despite error
+        assert not thread.is_alive()
+
+    def test_on_text_not_called_for_empty_transcription(self, mock_faster_whisper):
+        """When transcription returns empty string, on_text is NOT called."""
+        _, mock_instance = mock_faster_whisper
+        mock_instance.transcribe.return_value = ([], MagicMock())
+
+        received = []
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=received.append
+        )
+        thread.start()
+        thread.feed(np.zeros(SAMPLE_RATE, dtype=np.float32))
+        time.sleep(0.3)
+        thread.stop()
+        thread.join(timeout=2)
+        assert received == []
+
+    def test_half_chunk_not_transcribed_until_stop(self, mock_faster_whisper):
+        """With chunk_seconds=1, feeding 0.5s should NOT trigger transcription until stop."""
+        _, mock_instance = mock_faster_whisper
+        seg = MagicMock()
+        seg.text = "at stop"
+        mock_instance.transcribe.return_value = ([seg], MagicMock())
+
+        received = []
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=received.append
+        )
+        thread.start()
+        thread.feed(np.zeros(8000, dtype=np.float32))  # 0.5 seconds
+        time.sleep(0.3)
+        # Should not have transcribed yet (buffer < chunk_frames)
+        mid_count = len(received)
+        thread.stop()
+        thread.join(timeout=2)
+        # Now it should have transcribed the remaining buffer
+        assert len(received) > mid_count
+
+    def test_daemon_flag_set(self, mock_faster_whisper):
+        """Thread must be a daemon thread."""
+        _, mock_instance = mock_faster_whisper
+        t = LiveTranscriber(model_name="base")
+        thread = LiveTranscriberThread(
+            transcriber=t, chunk_seconds=1, sample_rate=SAMPLE_RATE, on_text=lambda x: None
+        )
+        assert thread.daemon is True
+
+
+# ============================================================
+# LiveRecorder edge cases (AC-4.1 through AC-4.8)
+# ============================================================
+
+
+class TestLiveRecorder:
+    def test_start_calls_input_stream_and_start(self, mock_sd):
+        """AC-4.1"""
+        r = LiveRecorder(sample_rate=16000)
+        r.start()
+        mock_sd.InputStream.assert_called_once()
+        mock_sd.InputStream.return_value.start.assert_called_once()
+
+    def test_start_while_recording_raises_exact_message(self, mock_sd):
+        """AC-4.2: exact message 'Already recording'."""
+        r = LiveRecorder()
+        r.start()
+        with pytest.raises(LiveRecordingError, match="^Already recording$"):
+            r.start()
+
+    def test_stop_without_start_raises_exact_message(self, mock_sd):
+        """AC-4.3: exact message with em dash."""
+        r = LiveRecorder()
+        with pytest.raises(LiveRecordingError, match="Not recording .* call start"):
+            r.stop()
+
+    def test_stop_error_message_contains_em_dash(self, mock_sd):
+        """The error message must contain an em dash, not a hyphen."""
+        r = LiveRecorder()
+        try:
+            r.stop()
+        except LiveRecordingError as e:
+            assert "\u2014" in str(e), f"Expected em dash in error, got: {str(e)!r}"
+
+    def test_is_recording_lifecycle(self, mock_sd):
+        """AC-4.4"""
+        r = LiveRecorder()
+        assert not r.is_recording
+        r.start()
+        assert r.is_recording
+        r.stop()
+        assert not r.is_recording
+
+    def test_callback_flattens_2d_to_1d(self, mock_sd):
+        """AC-4.5: _callback puts flattened 1D float32 into queue."""
+        r = LiveRecorder()
+        r.start()
+        frames = np.ones((800, 1), dtype=np.float32) * 0.5
+        r._callback(frames, None, None, None)
+        chunk = r._queue.get_nowait()
+        assert chunk.shape == (800,)
+        assert chunk.dtype == np.float32
+        np.testing.assert_allclose(chunk, 0.5)
+
+    def test_drain_concatenates(self, mock_sd):
+        """AC-4.6"""
+        r = LiveRecorder()
+        chunk1 = np.ones(800, dtype=np.float32)
+        chunk2 = np.ones(800, dtype=np.float32) * 2
+        r._queue.put(chunk1)
+        r._queue.put(chunk2)
+        drained = r.drain()
+        assert len(drained) == 1600
+        assert drained.dtype == np.float32
+        np.testing.assert_allclose(drained[:800], 1.0)
+        np.testing.assert_allclose(drained[800:], 2.0)
+
+    def test_drain_empty_queue_returns_empty_array(self, mock_sd):
+        """AC-4.7"""
+        r = LiveRecorder()
+        drained = r.drain()
+        assert len(drained) == 0
+        assert drained.dtype == np.float32
+        assert isinstance(drained, np.ndarray)
+
+    def test_sounddevice_failure_raises_with_message(self, mock_sd):
+        """AC-4.8"""
+        mock_sd.InputStream.side_effect = Exception("no mic")
+        r = LiveRecorder()
+        with pytest.raises(LiveRecordingError, match="no mic"):
+            r.start()
+        assert not r.is_recording
+
+    def test_callback_with_multi_channel_takes_first_channel(self, mock_sd):
+        """Multi-channel audio should be flattened to first channel only."""
+        r = LiveRecorder()
+        r.start()
+        # Simulate 2-channel input (even though we request 1)
+        frames = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32)
+        r._callback(frames, None, None, None)
+        chunk = r._queue.get_nowait()
+        assert chunk.shape == (3,)
+        np.testing.assert_allclose(chunk, [1.0, 3.0, 5.0])
+
+    def test_drain_can_be_called_without_is_recording(self, mock_sd):
+        """drain() does not require is_recording to be True."""
+        r = LiveRecorder()
+        assert not r.is_recording
+        r._queue.put(np.ones(100, dtype=np.float32))
+        drained = r.drain()
+        assert len(drained) == 100
+
+    def test_stop_calls_stream_stop_and_close(self, mock_sd):
+        """stop() must call stream.stop() then stream.close()."""
+        r = LiveRecorder()
+        r.start()
+        stream = mock_sd.InputStream.return_value
+        r.stop()
+        stream.stop.assert_called_once()
+        stream.close.assert_called_once()
+
+    def test_callback_copies_data(self, mock_sd):
+        """_callback must copy data (not store a reference to mutable input)."""
+        r = LiveRecorder()
+        r.start()
+        original = np.ones((100, 1), dtype=np.float32)
+        r._callback(original, None, None, None)
+        # Mutate the original
+        original[:] = 999.0
+        chunk = r._queue.get_nowait()
+        # The queued data should still be 1.0, not 999.0
+        np.testing.assert_allclose(chunk, 1.0)
+
+    def test_sounddevice_start_failure_cleans_up_stream(self, mock_sd):
+        """If stream.start() raises, _stream should be set back to None."""
+        mock_sd.InputStream.return_value.start.side_effect = Exception("start failed")
+        r = LiveRecorder()
+        with pytest.raises(LiveRecordingError, match="start failed"):
+            r.start()
+        assert not r.is_recording
+
+
+# ============================================================
+# LiveWindow edge cases (AC-5.1 through AC-5.6)
+# ============================================================
+
+
+class TestLiveWindow:
+    def test_constructor_calls_tk(self, mock_tk):
+        """AC-5.1"""
+        lw, tk_mock = mock_tk
+        lw.LiveWindow(on_close=MagicMock())
+        tk_mock.Tk.assert_called_once()
+
+    def test_append_calls_root_after(self, mock_tk):
+        """AC-5.2"""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.append("hello")
+        win.root.after.assert_called()
+
+    def test_on_close_calls_callback_each_time(self, mock_tk):
+        """AC-5.3: _on_close fires callback each time (no internal guard)."""
+        lw, tk_mock = mock_tk
+        on_close = MagicMock()
+        win = lw.LiveWindow(on_close=on_close)
+        win._on_close()
+        win._on_close()
+        win._on_close()
+        assert on_close.call_count == 3
+
+    def test_destroy_twice_no_error(self, mock_tk):
+        """AC-5.4"""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.destroy()
+        win.destroy()  # no error
+
+    def test_append_after_destroy_noop(self, mock_tk):
+        """AC-5.5"""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.destroy()
+        # Reset mock to verify no new calls
+        win.root.after.reset_mock()
+        win.append("should not appear")
+        win.root.after.assert_not_called()
+
+    def test_get_text_after_destroy_returns_empty(self, mock_tk):
+        """AC-5.6"""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.destroy()
+        assert win.get_text() == ""
+
+    def test_on_close_does_not_call_destroy(self, mock_tk):
+        """Spec: _on_close does NOT call destroy -- app.py is responsible."""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win._on_close()
+        assert win._destroyed is False
+
+    def test_update_after_destroy_is_noop(self, mock_tk):
+        """update() after destroy should not call root.update()."""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.destroy()
+        win.root.update.reset_mock()
+        win.update()
+        win.root.update.assert_not_called()
+
+    def test_window_title_contains_live_transcript(self, mock_tk):
+        """Spec: title must contain 'Live Transcript'."""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.root.title.assert_called()
+        title_arg = win.root.title.call_args[0][0]
+        assert "Live Transcript" in title_arg
+
+    def test_window_geometry_500x250(self, mock_tk):
+        """Spec: geometry '500x250'."""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.root.geometry.assert_called_with("500x250")
+
+    def test_window_always_on_top(self, mock_tk):
+        """Spec: wm_attributes('-topmost', True)."""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.root.wm_attributes.assert_called_with("-topmost", True)
+
+    def test_destroy_swallows_root_destroy_exception(self, mock_tk):
+        """destroy() should swallow exceptions from root.destroy()."""
+        lw, tk_mock = mock_tk
+        win = lw.LiveWindow(on_close=MagicMock())
+        win.root.destroy.side_effect = RuntimeError("already destroyed")
+        win.destroy()  # should not raise
+        assert win._destroyed is True

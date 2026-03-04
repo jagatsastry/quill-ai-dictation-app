@@ -17,6 +17,7 @@ git clone https://github.com/YOUR_USERNAME/whisper-notes
 cd whisper-notes
 uv venv && source .venv/bin/activate
 uv sync
+uv pip install -e .
 ```
 
 ## Run

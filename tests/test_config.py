@@ -49,3 +49,37 @@ def test_invalid_ollama_timeout(monkeypatch):
     monkeypatch.setenv("OLLAMA_TIMEOUT", "not-a-number")
     with pytest.raises(ConfigError, match="OLLAMA_TIMEOUT"):
         Config()
+
+
+def test_live_chunk_seconds_default():
+    cfg = Config()
+    assert cfg.live_chunk_seconds == 3
+
+
+def test_live_chunk_seconds_override(monkeypatch):
+    monkeypatch.setenv("LIVE_CHUNK_SECONDS", "5")
+    cfg = Config()
+    assert cfg.live_chunk_seconds == 5
+
+
+def test_live_chunk_seconds_invalid(monkeypatch):
+    monkeypatch.setenv("LIVE_CHUNK_SECONDS", "nope")
+    with pytest.raises(ConfigError, match="LIVE_CHUNK_SECONDS"):
+        Config()
+
+
+def test_live_chunk_seconds_less_than_one(monkeypatch):
+    monkeypatch.setenv("LIVE_CHUNK_SECONDS", "0")
+    with pytest.raises(ConfigError, match="LIVE_CHUNK_SECONDS must be >= 1"):
+        Config()
+
+
+def test_faster_whisper_model_default():
+    cfg = Config()
+    assert cfg.faster_whisper_model == "base"
+
+
+def test_faster_whisper_model_override(monkeypatch):
+    monkeypatch.setenv("FASTER_WHISPER_MODEL", "small")
+    cfg = Config()
+    assert cfg.faster_whisper_model == "small"

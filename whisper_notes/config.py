@@ -16,6 +16,8 @@ class Config:
     ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "gemma2:9b"))
     ollama_timeout: str = field(default_factory=lambda: os.getenv("OLLAMA_TIMEOUT", "60"))
     notes_dir: Path = field(default_factory=lambda: Path(os.getenv("NOTES_DIR", "~/Notes")))
+    faster_whisper_model: str = field(default_factory=lambda: os.getenv("FASTER_WHISPER_MODEL", "base"))
+    live_chunk_seconds: str = field(default_factory=lambda: os.getenv("LIVE_CHUNK_SECONDS", "3"))
 
     def __post_init__(self):
         if self.whisper_model not in VALID_WHISPER_MODELS:
@@ -30,3 +32,9 @@ class Config:
         except (ValueError, TypeError):
             raise ConfigError(f"OLLAMA_TIMEOUT '{self.ollama_timeout}' must be an integer")
         self.notes_dir = Path(self.notes_dir).expanduser()
+        try:
+            self.live_chunk_seconds = int(self.live_chunk_seconds)
+        except (ValueError, TypeError):
+            raise ConfigError(f"LIVE_CHUNK_SECONDS '{self.live_chunk_seconds}' must be an integer")
+        if self.live_chunk_seconds < 1:
+            raise ConfigError(f"LIVE_CHUNK_SECONDS must be >= 1, got {self.live_chunk_seconds}")

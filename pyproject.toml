@@ -10,6 +10,7 @@ dependencies = [
     "numpy",
     "rumps",
     "httpx",
+    "faster-whisper",
 ]
 
 [project.scripts]

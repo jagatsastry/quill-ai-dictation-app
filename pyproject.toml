@@ -19,6 +19,7 @@ whisper-notes = "whisper_notes.app:main"
 dev = [
     "pytest>=8",
     "pytest-mock>=3",
+    "respx>=0.22.0",
     "ruff>=0.4",
 ]
 

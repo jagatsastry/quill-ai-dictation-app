@@ -1,7 +1,6 @@
 import pytest
 from pathlib import Path
 from datetime import datetime
-from unittest.mock import patch
 from whisper_notes.note_writer import NoteWriter, NoteWriteError
 
 
@@ -67,8 +66,10 @@ def test_filename_collision_appends_suffix(tmp_notes_dir):
     dt = datetime(2026, 3, 4, 14, 32, 0)
     path1 = writer.write(transcript="first", summary=None, duration_seconds=1, model="base", recorded_at=dt)
     path2 = writer.write(transcript="second", summary=None, duration_seconds=1, model="base", recorded_at=dt)
+    path3 = writer.write(transcript="third", summary=None, duration_seconds=1, model="base", recorded_at=dt)
     assert path1.name == "2026-03-04-14-32.md"
     assert path2.name == "2026-03-04-14-32-2.md"
+    assert path3.name == "2026-03-04-14-32-3.md"
 
 
 def test_notes_dir_is_file_raises_error(tmp_path):

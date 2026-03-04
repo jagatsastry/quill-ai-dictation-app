@@ -38,9 +38,11 @@ def test_silent_audio_returns_empty_string(mock_whisper_model, fixtures_dir):
 
 
 def test_missing_file_raises_error(mock_whisper_model):
+    mock_whisper, _ = mock_whisper_model
     t = Transcriber(model_name="base")
     with pytest.raises(TranscriptionError, match="not found"):
         t.transcribe(Path("/tmp/does_not_exist_whisper_test.wav"))
+    mock_whisper.load_model.assert_not_called()
 
 
 def test_model_loaded_once_on_first_use(mock_whisper_model, fixtures_dir):

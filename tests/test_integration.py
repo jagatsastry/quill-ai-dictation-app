@@ -16,7 +16,7 @@ from whisper_notes.note_writer import NoteWriter
 
 
 @pytest.fixture
-def mock_transcriber(fixtures_dir):
+def mock_transcriber():
     with patch("whisper_notes.transcriber.whisper") as mock_whisper:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = {"text": " This is a test note about the team meeting."}
@@ -51,21 +51,27 @@ def test_full_pipeline_with_ollama(mock_transcriber, tmp_notes_dir, respx_mock, 
     assert "Action items" in content
     assert "This is a test note" in content
     assert "1m 2s" in content
+    assert "## Summary" in content
+    assert "## Transcript" in content
 
 
 def test_full_pipeline_ollama_offline(mock_transcriber, tmp_notes_dir, fixtures_dir):
     """When Ollama is unreachable, raw transcript is still saved."""
     from whisper_notes.summarizer import SummarizerError
+    import httpx
+    from unittest.mock import patch
 
-    summarizer = Summarizer(ollama_url="http://localhost:1", model="gemma2:9b", timeout=1)
     writer = NoteWriter(notes_dir=tmp_notes_dir)
     recorded_at = datetime(2026, 3, 4, 10, 0, 0)
 
     transcript = mock_transcriber.transcribe(fixtures_dir / "silent_1s.wav")
-    try:
-        summary = summarizer.summarize(transcript)
-    except SummarizerError:
-        summary = None
+
+    with patch("whisper_notes.summarizer.httpx.post", side_effect=httpx.ConnectError("refused")):
+        summarizer = Summarizer(ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10)
+        try:
+            summary = summarizer.summarize(transcript)
+        except SummarizerError:
+            summary = None
 
     path = writer.write(
         transcript=transcript,

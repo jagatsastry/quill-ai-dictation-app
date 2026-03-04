@@ -16,7 +16,9 @@ class Config:
     ollama_model: str = field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "gemma2:9b"))
     ollama_timeout: str = field(default_factory=lambda: os.getenv("OLLAMA_TIMEOUT", "60"))
     notes_dir: Path = field(default_factory=lambda: Path(os.getenv("NOTES_DIR", "~/Notes")))
-    faster_whisper_model: str = field(default_factory=lambda: os.getenv("FASTER_WHISPER_MODEL", "base"))
+    faster_whisper_model: str = field(
+        default_factory=lambda: os.getenv("FASTER_WHISPER_MODEL", "base")
+    )
     live_chunk_seconds: str = field(default_factory=lambda: os.getenv("LIVE_CHUNK_SECONDS", "3"))
 
     def __post_init__(self):

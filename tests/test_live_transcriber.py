@@ -1,8 +1,8 @@
 import time
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from unittest.mock import patch, MagicMock
 
 from whisper_notes.live_transcriber import (
     LiveTranscriber,

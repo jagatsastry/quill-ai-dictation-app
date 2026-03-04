@@ -1,7 +1,7 @@
 import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
-from unittest.mock import patch, MagicMock
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def mock_tk():
 def test_live_window_creates_root(mock_tk):
     lw, tk_mock = mock_tk
     on_close = MagicMock()
-    win = lw.LiveWindow(on_close=on_close)
+    lw.LiveWindow(on_close=on_close)
     tk_mock.Tk.assert_called_once()
 
 

@@ -1,6 +1,7 @@
+from unittest.mock import patch
+
 import numpy as np
 import pytest
-from unittest.mock import patch, MagicMock
 
 from whisper_notes.live_recorder import LiveRecorder, LiveRecordingError
 

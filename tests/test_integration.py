@@ -104,3 +104,67 @@ def test_notes_dir_created_on_first_run(tmp_path, mock_transcriber, respx_mock, 
     )
     assert notes_dir.exists()
     assert notes_dir.is_dir()
+
+
+def test_live_pipeline_full(tmp_notes_dir, respx_mock):
+    """Full live pipeline: fake audio chunks -> faster-whisper mock -> Ollama mock -> note saved."""
+    import time
+
+    import numpy as np
+
+    from whisper_notes.live_transcriber import LiveTranscriber, LiveTranscriberThread
+    from whisper_notes.note_writer import NoteWriter
+    from whisper_notes.summarizer import Summarizer
+
+    respx_mock.post("http://localhost:11434/api/generate").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "response": "- Live meeting note\n- Key decision made",
+                "done": True,
+            },
+        )
+    )
+
+    with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:
+        call_count = [0]
+
+        def fake_transcribe(audio, **kwargs):
+            call_count[0] += 1
+            seg = MagicMock()
+            seg.text = f"chunk {call_count[0]}"
+            return [seg], MagicMock()
+
+        MockModel.return_value.transcribe.side_effect = fake_transcribe
+
+        transcriber = LiveTranscriber(model_name="base")
+        collected = []
+        thread = LiveTranscriberThread(
+            transcriber=transcriber,
+            chunk_seconds=1,
+            sample_rate=16000,
+            on_text=collected.append,
+        )
+        thread.start()
+        for _ in range(3):
+            thread.feed(np.zeros(16000, dtype=np.float32))
+        time.sleep(0.5)
+        thread.stop()
+        thread.join(timeout=5)
+
+    full_transcript = " ".join(collected)
+    summarizer = Summarizer(ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10)
+    writer = NoteWriter(notes_dir=tmp_notes_dir)
+    summary = summarizer.summarize(full_transcript)
+    path = writer.write(
+        transcript=full_transcript,
+        summary=summary,
+        duration_seconds=0,
+        model="live/base",
+        recorded_at=datetime(2026, 3, 4, 15, 0, 0),
+    )
+    content = path.read_text()
+    assert "chunk" in content
+    assert "Live meeting note" in content
+    assert "## Summary" in content
+    assert "## Transcript" in content

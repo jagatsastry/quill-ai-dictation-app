@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from whisper_notes.config import Config
+from whisper_notes.dictator import DictationError as _RealDictationError
 from whisper_notes.live_recorder import LiveRecordingError
 
 
@@ -19,6 +20,9 @@ def mock_rumps():
     """Mock the entire rumps module before importing app."""
     rumps_mock = MagicMock()
     rumps_mock.App = MagicMock
+
+    dictator_mock = MagicMock()
+    dictator_mock.DictationError = _RealDictationError
 
     sub_mocks = {
         "rumps": rumps_mock,
@@ -31,6 +35,7 @@ def mock_rumps():
         "whisper_notes.live_transcriber": MagicMock(),
         "whisper_notes.live_recorder": MagicMock(),
         "whisper_notes.live_window": MagicMock(),
+        "whisper_notes.dictator": dictator_mock,
     }
 
     with patch.dict("sys.modules", sub_mocks):
@@ -55,7 +60,8 @@ def _make_app(mock_rumps, tmp_notes_dir):
          patch("whisper_notes.app.LiveTranscriber") as MockLiveTranscriber, \
          patch("whisper_notes.app.LiveTranscriberThread") as MockThread, \
          patch("whisper_notes.app.subprocess") as MockSubprocess, \
-         patch("whisper_notes.app.MenuBarButton"):
+         patch("whisper_notes.app.MenuBarButton"), \
+         patch("whisper_notes.app.Dictator"):
         MockWriter.return_value.notes_dir = tmp_notes_dir
         app = app_module.WhisperNotesApp(cfg)
         # Store references for test assertions

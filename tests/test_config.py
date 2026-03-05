@@ -83,3 +83,63 @@ def test_faster_whisper_model_override(monkeypatch):
     monkeypatch.setenv("FASTER_WHISPER_MODEL", "small")
     cfg = Config()
     assert cfg.faster_whisper_model == "small"
+
+
+# --- Dictation config tests ---
+
+
+def test_dictation_hotkey_default():
+    cfg = Config()
+    assert cfg.dictation_hotkey == "alt_r"
+
+
+def test_dictation_hotkey_override(monkeypatch):
+    monkeypatch.setenv("DICTATION_HOTKEY", "ctrl_l")
+    cfg = Config()
+    assert cfg.dictation_hotkey == "ctrl_l"
+
+
+def test_dictation_hotkey_empty(monkeypatch):
+    monkeypatch.setenv("DICTATION_HOTKEY", "")
+    with pytest.raises(ConfigError, match="DICTATION_HOTKEY must not be empty"):
+        Config()
+
+
+def test_dictation_model_defaults_to_faster_whisper_model():
+    cfg = Config()
+    assert cfg.dictation_model == cfg.faster_whisper_model
+
+
+def test_dictation_model_override(monkeypatch):
+    monkeypatch.setenv("DICTATION_MODEL", "small")
+    cfg = Config()
+    assert cfg.dictation_model == "small"
+
+
+def test_dictation_max_seconds_default():
+    cfg = Config()
+    assert cfg.dictation_max_seconds == 30
+
+
+def test_dictation_max_seconds_override(monkeypatch):
+    monkeypatch.setenv("DICTATION_MAX_SECONDS", "60")
+    cfg = Config()
+    assert cfg.dictation_max_seconds == 60
+
+
+def test_dictation_max_seconds_invalid(monkeypatch):
+    monkeypatch.setenv("DICTATION_MAX_SECONDS", "abc")
+    with pytest.raises(ConfigError, match="DICTATION_MAX_SECONDS.*must be an integer"):
+        Config()
+
+
+def test_dictation_max_seconds_less_than_one(monkeypatch):
+    monkeypatch.setenv("DICTATION_MAX_SECONDS", "0")
+    with pytest.raises(ConfigError, match="must be >= 1"):
+        Config()
+
+
+def test_dictation_max_seconds_greater_than_300(monkeypatch):
+    monkeypatch.setenv("DICTATION_MAX_SECONDS", "301")
+    with pytest.raises(ConfigError, match="must be <= 300"):
+        Config()

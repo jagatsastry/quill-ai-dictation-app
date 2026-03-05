@@ -11,6 +11,7 @@ dependencies = [
     "rumps",
     "httpx",
     "faster-whisper",
+    "pynput>=1.8.1",
 ]
 
 [project.scripts]

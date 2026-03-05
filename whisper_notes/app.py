@@ -9,6 +9,7 @@ import rumps
 from AppKit import NSStatusBar, NSVariableStatusItemLength
 
 from whisper_notes.config import Config
+from whisper_notes.dictator import DictationError, Dictator
 from whisper_notes.live_recorder import LiveRecorder
 from whisper_notes.live_recorder import LiveRecordingError as LiveRecErr
 from whisper_notes.live_transcriber import (
@@ -26,6 +27,7 @@ ICONS = {
     "processing": "⏳",
     "error": "⚠",
     "live": "🔴",
+    "dictation": "🎤",
 }
 
 
@@ -85,6 +87,11 @@ class WhisperNotesApp(rumps.App):
         self._stop_live_btn = rumps.MenuItem("Stop Live", callback=self._on_stop_live)
         self._stop_live_btn.set_callback(None)  # disabled initially
 
+        self._dictation_btn = rumps.MenuItem(
+            "Enable Dictation", callback=self._on_enable_dictation
+        )
+        self._dictator: Dictator | None = None
+
         self._open_btn = rumps.MenuItem("Open Notes Folder", callback=self._on_open_notes)
 
         self.menu = [
@@ -92,10 +99,11 @@ class WhisperNotesApp(rumps.App):
             self._stop_btn,
             self._live_btn,
             self._stop_live_btn,
+            self._dictation_btn,
             None,
             self._open_btn,
             None,
-            rumps.MenuItem("Quit", callback=rumps.quit_application),
+            rumps.MenuItem("Quit", callback=self._on_quit),
         ]
 
     def _set_state(self, state: str, status: str | None = None):
@@ -113,12 +121,14 @@ class WhisperNotesApp(rumps.App):
         self._stop_bar_btn = MenuBarButton("⏹ Stop", lambda: self._on_stop_recording(None))
         self._start_btn.set_callback(None)
         self._live_btn.set_callback(None)
+        self._dictation_btn.set_callback(None)
         self._stop_btn.set_callback(self._on_stop_recording)
 
     def _on_stop_recording(self, _):
         self._stop_btn.set_callback(None)
         self._start_btn.set_callback(None)
         self._live_btn.set_callback(None)
+        self._dictation_btn.set_callback(None)
         self._set_state("processing", "Transcribing...")
         thread = threading.Thread(target=self._process_recording, daemon=True)
         thread.start()
@@ -206,6 +216,7 @@ class WhisperNotesApp(rumps.App):
         )
         self._live_btn.set_callback(None)
         self._start_btn.set_callback(None)
+        self._dictation_btn.set_callback(None)
         self._stop_live_btn.set_callback(self._on_stop_live)
         self._live_pump_timer = rumps.Timer(self._pump_live_audio, 0.1)
         self._live_pump_timer.start()
@@ -294,6 +305,71 @@ class WhisperNotesApp(rumps.App):
         self._stop_btn.set_callback(None)
         self._live_btn.set_callback(self._on_live_transcribe)
         self._stop_live_btn.set_callback(None)
+        self._dictation_btn.title = "Enable Dictation"
+        self._dictation_btn.set_callback(self._on_enable_dictation)
+
+    # --- Dictation Mode ---
+
+    def _on_enable_dictation(self, _):
+        if self.state == "dictation":
+            self._disable_dictation()
+            return
+        if self.state != "idle":
+            return
+        try:
+            self._dictator = Dictator(
+                hotkey=self.config.dictation_hotkey,
+                model_name=self.config.dictation_model,
+                max_seconds=self.config.dictation_max_seconds,
+                on_state_change=self._on_dictation_state_change,
+            )
+            self._dictator.start()
+        except DictationError as e:
+            msg = str(e)
+            if "accessibility" in msg.lower() or "permission" in msg.lower():
+                self._notify("Dictation Permission Required", msg)
+            else:
+                self._notify("Dictation Error", msg)
+            self._dictator = None
+            return
+        self._dictation_btn.title = "Disable Dictation"
+        self._set_state(
+            "dictation", f"Dictation (hold {self.config.dictation_hotkey} to speak)"
+        )
+        self._start_btn.set_callback(None)
+        self._live_btn.set_callback(None)
+
+    def _disable_dictation(self):
+        if self._dictator is not None:
+            self._dictator.stop()
+            self._dictator = None
+        self._dictation_btn.title = "Enable Dictation"
+        self._reset_to_idle()
+
+    def _on_quit(self, _):
+        if self._dictator is not None:
+            self._dictator.stop()
+            self._dictator = None
+        rumps.quit_application()
+
+    def _on_dictation_state_change(self, dictator_state: str):
+        if self.state != "dictation":
+            return
+        key = self.config.dictation_hotkey
+        if dictator_state == "idle":
+            self._set_state("dictation", f"Dictation (hold {key} to speak)")
+        elif dictator_state == "recording":
+            self._set_state("dictation", "Dictation: listening...")
+        elif dictator_state == "transcribing":
+            self._set_state("dictation", "Dictation: transcribing...")
+        elif dictator_state == "error":
+            self._set_state("dictation", "Dictation: mic error")
+            threading.Timer(
+                2.0,
+                lambda: self._set_state("dictation", f"Dictation (hold {key} to speak)")
+                if self.state == "dictation"
+                else None,
+            ).start()
 
     def _on_open_notes(self, _):
         import subprocess

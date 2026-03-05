@@ -20,6 +20,15 @@ class Config:
         default_factory=lambda: os.getenv("FASTER_WHISPER_MODEL", "base")
     )
     live_chunk_seconds: str = field(default_factory=lambda: os.getenv("LIVE_CHUNK_SECONDS", "3"))
+    dictation_hotkey: str = field(
+        default_factory=lambda: os.getenv("DICTATION_HOTKEY", "alt_r")
+    )
+    dictation_model: str = field(
+        default_factory=lambda: os.getenv("DICTATION_MODEL", "")
+    )
+    dictation_max_seconds: str = field(
+        default_factory=lambda: os.getenv("DICTATION_MAX_SECONDS", "30")
+    )
 
     def __post_init__(self):
         if self.whisper_model not in VALID_WHISPER_MODELS:
@@ -40,3 +49,21 @@ class Config:
             raise ConfigError(f"LIVE_CHUNK_SECONDS '{self.live_chunk_seconds}' must be an integer")
         if self.live_chunk_seconds < 1:
             raise ConfigError(f"LIVE_CHUNK_SECONDS must be >= 1, got {self.live_chunk_seconds}")
+        if not self.dictation_hotkey:
+            raise ConfigError("DICTATION_HOTKEY must not be empty")
+        if not self.dictation_model:
+            self.dictation_model = self.faster_whisper_model
+        try:
+            self.dictation_max_seconds = int(self.dictation_max_seconds)
+        except (ValueError, TypeError):
+            raise ConfigError(
+                f"DICTATION_MAX_SECONDS '{self.dictation_max_seconds}' must be an integer"
+            )
+        if self.dictation_max_seconds < 1:
+            raise ConfigError(
+                f"DICTATION_MAX_SECONDS must be >= 1, got {self.dictation_max_seconds}"
+            )
+        if self.dictation_max_seconds > 300:
+            raise ConfigError(
+                f"DICTATION_MAX_SECONDS must be <= 300, got {self.dictation_max_seconds}"
+            )

@@ -113,6 +113,49 @@ def check_record_note(record_seconds=3):
     tmp.unlink(missing_ok=True)
 
 
+def check_live_transcribe_real(record_seconds=5):
+    section(f"Live Transcribe pipeline (real mic + real faster-whisper, {record_seconds}s)")
+
+    from whisper_notes.live_recorder import LiveRecorder
+    from whisper_notes.live_transcriber import LiveTranscriber
+    from whisper_notes.note_writer import NoteWriter
+    from whisper_notes.config import Config
+
+    cfg = Config()
+
+    print(f"  Recording {record_seconds}s of real mic audio...")
+    recorder = LiveRecorder(sample_rate=16000)
+    recorder.start()
+    time.sleep(record_seconds)
+    audio = recorder.stop()
+    ok(f"Captured {len(audio)} samples ({len(audio)/16000:.1f}s)")
+
+    print("  Loading faster-whisper model (downloads ~75MB on first run)...")
+    transcriber = LiveTranscriber(model_name=cfg.faster_whisper_model)
+    transcriber._load_model()
+    ok("Model loaded")
+
+    print("  Transcribing...")
+    t0 = time.time()
+    text = transcriber.transcribe_chunk(audio)
+    ok(f"Transcribed in {time.time()-t0:.1f}s — '{text or '(silence)'}'")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        writer = NoteWriter(notes_dir=Path(tmpdir))
+        path = writer.write(
+            transcript=text or "(no speech detected)",
+            summary=None,
+            duration_seconds=record_seconds,
+            model=f"live/{cfg.faster_whisper_model}",
+            recorded_at=datetime.now(),
+        )
+        content = path.read_text()
+        assert "## Transcript" in content
+        assert f"live/{cfg.faster_whisper_model}" in content
+        ok(f"Note written: {path.name}")
+        print(f"\n--- note preview ---\n{content[:300]}\n--------------------")
+
+
 def check_live_transcribe():
     section("Live Transcribe pipeline (mocked faster-whisper)")
 
@@ -187,12 +230,13 @@ def check_live_transcribe():
 def main():
     parser = argparse.ArgumentParser(description="Verify whisper-notes end-to-end")
     parser.add_argument("--record", action="store_true", help="Record Note pipeline only")
-    parser.add_argument("--live", action="store_true", help="Live Transcribe pipeline only")
+    parser.add_argument("--live", action="store_true", help="Live Transcribe pipeline only (mocked)")
+    parser.add_argument("--live-real", action="store_true", help="Live Transcribe with real mic + real faster-whisper")
     parser.add_argument("--env", action="store_true", help="Environment checks only")
     parser.add_argument("--seconds", type=int, default=3, help="Recording duration (default: 3)")
     args = parser.parse_args()
 
-    run_all = not (args.record or args.live or args.env)
+    run_all = not (args.record or args.live or args.env or args.live_real)
 
     try:
         if run_all or args.env:
@@ -201,6 +245,8 @@ def main():
             check_record_note(record_seconds=args.seconds)
         if run_all or args.live:
             check_live_transcribe()
+        if args.live_real:
+            check_live_transcribe_real(record_seconds=args.seconds)
         print("\n✓ All checks passed\n")
     except SystemExit:
         print("\n✗ Verification failed\n")

@@ -27,11 +27,9 @@ import numpy as np
 import pytest
 
 from whisper_notes.config import Config
-from whisper_notes.live_recorder import LiveRecordingError
 from whisper_notes.live_transcriber import (
     LiveTranscriber,
     LiveTranscriberThread,
-    LiveTranscriptionError,
 )
 from whisper_notes.note_writer import NoteWriter
 from whisper_notes.summarizer import Summarizer, SummarizerError
@@ -362,8 +360,11 @@ class TestOllamaOffline:
         transcript = " ".join(collected)
         summary = None
 
-        with patch("whisper_notes.summarizer.httpx.post", side_effect=httpx.ConnectError("refused")):
-            summarizer = Summarizer(ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10)
+        mock_side_effect = httpx.ConnectError("refused")
+        with patch("whisper_notes.summarizer.httpx.post", side_effect=mock_side_effect):
+            summarizer = Summarizer(
+                ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10
+            )
             try:
                 summary = summarizer.summarize(transcript)
             except SummarizerError:
@@ -682,7 +683,9 @@ class TestFasterWhisperMidStreamError:
     def test_error_on_second_chunk_still_saves_other_chunks(self, notes_dir, respx_mock):
         """Chunk 1 succeeds, chunk 2 raises, chunk 3 succeeds -> note has chunks 1 and 3."""
         respx_mock.post("http://localhost:11434/api/generate").mock(
-            return_value=httpx.Response(200, json={"response": "summary despite error", "done": True})
+            return_value=httpx.Response(
+                200, json={"response": "summary despite error", "done": True}
+            )
         )
 
         with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:

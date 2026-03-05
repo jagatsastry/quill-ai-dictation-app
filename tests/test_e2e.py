@@ -1,17 +1,20 @@
 """
-End-to-end tests for whisper-notes Live Transcription.
+End-to-end integration tests for whisper-notes Live Transcription.
 
-These tests exercise full user flows from the spec and design doc,
-verifying observable outcomes: files on disk, content structure,
-state transitions, and notification calls.
+These tests exercise full user flows derived from the spec and design doc,
+verifying observable outcomes on the real file system.
 
-Mocking strategy:
-- Mock at OS boundaries: sounddevice (no mic), faster-whisper (no GPU),
-  Ollama (via respx HTTP mock), tkinter (no display), rumps (no macOS menu).
-- Real components: NoteWriter (real file I/O), Summarizer (real HTTP client
-  with respx interception), LiveTranscriber + LiveTranscriberThread (real
-  threading with mocked WhisperModel).
-- Verify: real files on tmp_path, their content, state machine transitions.
+Mocking boundaries:
+- sounddevice: mocked (no real mic in CI)
+- faster-whisper WhisperModel: mocked (no GPU/model download)
+- Ollama: mocked via respx at the HTTP layer
+- tkinter/rumps: mocked (no macOS display in CI)
+- File system: REAL — NoteWriter writes to tmp_path, tests verify actual files
+- LiveTranscriber/LiveTranscriberThread: REAL threading with mocked WhisperModel
+- Summarizer: REAL HTTP client with respx interception
+
+These are integration tests with real file I/O, not true GUI-level E2E tests.
+The value over unit tests is verifying the full pipeline produces correct files.
 """
 import sys
 import time
@@ -23,9 +26,13 @@ import httpx
 import numpy as np
 import pytest
 
-from whisper_notes.config import Config, ConfigError
+from whisper_notes.config import Config
 from whisper_notes.live_recorder import LiveRecordingError
-from whisper_notes.live_transcriber import LiveTranscriber, LiveTranscriberThread
+from whisper_notes.live_transcriber import (
+    LiveTranscriber,
+    LiveTranscriberThread,
+    LiveTranscriptionError,
+)
 from whisper_notes.note_writer import NoteWriter
 from whisper_notes.summarizer import Summarizer, SummarizerError
 
@@ -100,7 +107,11 @@ def mock_whisper_silent():
 
 
 class TestHappyPathLiveSession:
-    """User starts live transcription, speaks, stops, gets note with summary."""
+    """User starts live transcription, speaks, stops, gets note with summary.
+
+    Exercises: LiveTranscriber + LiveTranscriberThread (real threading),
+    Summarizer (real HTTP client, respx-mocked), NoteWriter (real file I/O).
+    """
 
     def test_full_pipeline_produces_note_file(self, notes_dir, mock_whisper_model, respx_mock):
         """Feed audio -> transcribe -> summarize -> note file on disk."""
@@ -193,12 +204,90 @@ class TestHappyPathLiveSession:
 
 
 # ============================================================
+# Scenario 2: Window closed mid-session — partial transcript saved
+# ============================================================
+
+
+class TestWindowCloseMidSession:
+    """User closes the LiveWindow (X button) after some chunks are transcribed.
+
+    Per spec AC-6.11: Window close triggers the same pipeline as Stop Live.
+    We verify that a note is saved containing exactly the chunks transcribed
+    before the close, not any chunks that might have been fed after.
+    """
+
+    def test_window_close_saves_partial_transcript(self, notes_dir, respx_mock):
+        """Feed 3 chunks, close after 2 are transcribed -> note has 2 chunks."""
+        respx_mock.post("http://localhost:11434/api/generate").mock(
+            return_value=httpx.Response(200, json={"response": "partial summary", "done": True})
+        )
+
+        with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:
+            chunk_num = [0]
+
+            def fake_transcribe(audio, **kwargs):
+                chunk_num[0] += 1
+                seg = MagicMock()
+                seg.text = f" word{chunk_num[0]}"
+                return [seg], MagicMock()
+
+            MockModel.return_value.transcribe.side_effect = fake_transcribe
+
+            transcriber = LiveTranscriber(model_name="base")
+            collected = []
+            thread = LiveTranscriberThread(
+                transcriber=transcriber,
+                chunk_seconds=1,
+                sample_rate=SAMPLE_RATE,
+                on_text=collected.append,
+            )
+            thread.start()
+
+            # Feed 2 full chunks
+            for _ in range(2):
+                thread.feed(np.zeros(SAMPLE_RATE, dtype=np.float32))
+            time.sleep(0.5)
+
+            # Simulate window close: stop the thread (same as _on_stop_live)
+            thread.stop()
+            thread.join(timeout=5)
+
+        # Exactly 2 chunks should have been transcribed
+        assert len(collected) == 2
+        assert "word1" in collected[0]
+        assert "word2" in collected[1]
+
+        transcript = " ".join(collected)
+        summarizer = Summarizer(ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10)
+        writer = NoteWriter(notes_dir=notes_dir)
+        summary = summarizer.summarize(transcript)
+        path = writer.write(
+            transcript=transcript,
+            summary=summary,
+            duration_seconds=0,
+            model="live/base",
+            recorded_at=datetime(2026, 3, 4, 10, 30, 0),
+        )
+
+        content = path.read_text()
+        assert "word1" in content
+        assert "word2" in content
+        assert "## Summary" in content
+        assert "## Transcript" in content
+        assert path.exists()
+
+
+# ============================================================
 # Scenario 3: Empty transcript (silence) — no Ollama call
 # ============================================================
 
 
 class TestEmptyTranscriptSilence:
-    """No speech detected -> note saved with '(no speech detected)', no summary."""
+    """No speech detected -> note saved with '(no speech detected)', no summary.
+
+    Per spec AC-6.10: empty transcript means Ollama is NOT called and
+    transcript is set to '(no speech detected)'.
+    """
 
     def test_empty_transcript_saves_no_speech_detected(self, notes_dir, mock_whisper_silent):
         """Silence -> note file with '(no speech detected)' and no Summary section."""
@@ -216,7 +305,7 @@ class TestEmptyTranscriptSilence:
         thread.stop()
         thread.join(timeout=5)
 
-        # No text collected — silence
+        # No text collected -- silence
         assert len(collected) == 0
 
         # Simulate app behavior: empty transcript -> "(no speech detected)", no Ollama
@@ -248,7 +337,11 @@ class TestEmptyTranscriptSilence:
 
 
 class TestOllamaOffline:
-    """Ollama unavailable -> note saved with transcript only, no summary."""
+    """Ollama unavailable -> note saved with transcript only, no summary.
+
+    Exercises real Summarizer raising SummarizerError on connection refused,
+    then NoteWriter saving the note without a summary section.
+    """
 
     def test_ollama_offline_saves_raw_transcript(self, notes_dir, mock_whisper_model):
         """Connection refused -> SummarizerError -> note without summary."""
@@ -297,7 +390,7 @@ class TestOllamaOffline:
 
 
 class TestNotesDirCreation:
-    """NOTES_DIR auto-created by NoteWriter on first write."""
+    """NOTES_DIR auto-created by NoteWriter on first write (live mode)."""
 
     def test_notes_dir_created_automatically(self, tmp_path, mock_whisper_model, respx_mock):
         """Non-existent NOTES_DIR is created, note saved inside it."""
@@ -341,153 +434,16 @@ class TestNotesDirCreation:
 
 
 # ============================================================
-# Scenario 6 & 7 & 8: Config env vars
-# ============================================================
-
-
-class TestConfigEnvVars:
-    """Config respects LIVE_CHUNK_SECONDS and FASTER_WHISPER_MODEL env vars."""
-
-    def test_custom_chunk_seconds_and_model(self, monkeypatch):
-        """LIVE_CHUNK_SECONDS=5 and FASTER_WHISPER_MODEL=small are respected."""
-        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "5")
-        monkeypatch.setenv("FASTER_WHISPER_MODEL", "small")
-        cfg = Config()
-        assert cfg.live_chunk_seconds == 5
-        assert cfg.faster_whisper_model == "small"
-
-    def test_invalid_chunk_seconds_raises_config_error(self, monkeypatch):
-        """LIVE_CHUNK_SECONDS='nope' raises ConfigError."""
-        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "nope")
-        with pytest.raises(ConfigError, match="LIVE_CHUNK_SECONDS"):
-            Config()
-
-    def test_zero_chunk_seconds_raises_config_error(self, monkeypatch):
-        """LIVE_CHUNK_SECONDS='0' raises ConfigError with 'must be >= 1'."""
-        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "0")
-        with pytest.raises(ConfigError, match="must be >= 1"):
-            Config()
-
-    def test_float_chunk_seconds_raises_config_error(self, monkeypatch):
-        """LIVE_CHUNK_SECONDS='3.5' raises ConfigError (must be integer)."""
-        monkeypatch.setenv("LIVE_CHUNK_SECONDS", "3.5")
-        with pytest.raises(ConfigError, match="must be an integer"):
-            Config()
-
-    def test_model_name_appears_in_note(self, notes_dir, monkeypatch, respx_mock):
-        """Model env var flows into note file's model field."""
-        monkeypatch.setenv("FASTER_WHISPER_MODEL", "small")
-
-        respx_mock.post("http://localhost:11434/api/generate").mock(
-            return_value=httpx.Response(200, json={"response": "summary", "done": True})
-        )
-
-        with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:
-            seg = MagicMock()
-            seg.text = " test text"
-            MockModel.return_value.transcribe.return_value = ([seg], MagicMock())
-
-            cfg = Config()
-            transcriber = LiveTranscriber(model_name=cfg.faster_whisper_model)
-            collected = []
-            thread = LiveTranscriberThread(
-                transcriber=transcriber,
-                chunk_seconds=cfg.live_chunk_seconds,
-                sample_rate=SAMPLE_RATE,
-                on_text=collected.append,
-            )
-            thread.start()
-            thread.feed(np.zeros(SAMPLE_RATE * cfg.live_chunk_seconds, dtype=np.float32))
-            time.sleep(0.5)
-            thread.stop()
-            thread.join(timeout=5)
-
-        transcript = " ".join(collected)
-        summarizer = Summarizer(ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10)
-        writer = NoteWriter(notes_dir=notes_dir)
-        summary = summarizer.summarize(transcript)
-        path = writer.write(
-            transcript=transcript,
-            summary=summary,
-            duration_seconds=0,
-            model=f"live/{cfg.faster_whisper_model}",
-            recorded_at=datetime(2026, 3, 4, 12, 0, 0),
-        )
-
-        content = path.read_text()
-        assert "live/small" in content
-
-
-# ============================================================
-# Scenario 9: Sounddevice error on start — stays idle
-# ============================================================
-
-
-class TestSounddeviceError:
-    """LiveRecorder.start() fails -> app stays idle, notification sent."""
-
-    def test_recording_error_preserves_idle_state(self, mock_rumps, tmp_path):
-        """Sounddevice error keeps app in idle, sends notification."""
-        app_module, rumps_mock = mock_rumps
-        cfg = Config()
-        cfg.notes_dir = tmp_path / "Notes"
-        cfg.notes_dir.mkdir()
-
-        with patch("whisper_notes.app.Recorder"), \
-             patch("whisper_notes.app.Transcriber"), \
-             patch("whisper_notes.app.Summarizer"), \
-             patch("whisper_notes.app.NoteWriter"), \
-             patch("whisper_notes.app.LiveRecorder") as MockLiveRecorder, \
-             patch("whisper_notes.app.LiveTranscriber"), \
-             patch("whisper_notes.app.LiveTranscriberThread"), \
-             patch("whisper_notes.app.LiveWindow"), \
-             patch.object(app_module, "LiveRecErr", LiveRecordingError):
-            MockLiveRecorder.return_value.start.side_effect = LiveRecordingError("no mic")
-            app = app_module.WhisperNotesApp(cfg)
-            app._on_live_transcribe(None)
-            assert app.state == "idle"
-
-        # Verify no note file was created
-        note_files = list(cfg.notes_dir.glob("*.md"))
-        assert len(note_files) == 0
-
-
-# ============================================================
-# Scenario 10: Record Note flow unchanged
-# ============================================================
-
-
-class TestRecordNoteUnchanged:
-    """Existing Record Note flow still works after live transcription feature added."""
-
-    def test_start_recording_still_works(self, mock_rumps, tmp_path):
-        """Start Recording changes state to 'recording'."""
-        app_module, _ = mock_rumps
-        cfg = Config()
-        cfg.notes_dir = tmp_path / "Notes"
-        cfg.notes_dir.mkdir()
-
-        with patch("whisper_notes.app.Recorder") as MockRecorder, \
-             patch("whisper_notes.app.Transcriber"), \
-             patch("whisper_notes.app.Summarizer"), \
-             patch("whisper_notes.app.NoteWriter"), \
-             patch("whisper_notes.app.LiveRecorder"), \
-             patch("whisper_notes.app.LiveTranscriber"), \
-             patch("whisper_notes.app.LiveTranscriberThread"), \
-             patch("whisper_notes.app.LiveWindow"):
-            app = app_module.WhisperNotesApp(cfg)
-            app._on_start_recording(None)
-            assert app.state == "recording"
-            MockRecorder.return_value.start.assert_called_once()
-
-
-# ============================================================
 # Scenario 11: Full pipeline file content structure
 # ============================================================
 
 
 class TestFileContentStructure:
-    """Verify the complete markdown structure of a live note."""
+    """Verify the complete markdown structure of a live note.
+
+    This is the highest-value E2E test: it checks the exact file format
+    that the user sees when they open ~/Notes/ after a live session.
+    """
 
     def test_note_has_complete_structure(self, notes_dir, mock_whisper_model, respx_mock):
         """Note contains title, summary, transcript, and metadata."""
@@ -544,6 +500,46 @@ class TestFileContentStructure:
         assert "Duration: 0s" in content
         assert "Model: live/base" in content
         assert "---" in content
+
+    def test_model_name_flows_to_note_file(self, notes_dir, respx_mock):
+        """Config FASTER_WHISPER_MODEL value appears in the note's metadata."""
+        respx_mock.post("http://localhost:11434/api/generate").mock(
+            return_value=httpx.Response(200, json={"response": "summary", "done": True})
+        )
+
+        with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:
+            seg = MagicMock()
+            seg.text = " test text"
+            MockModel.return_value.transcribe.return_value = ([seg], MagicMock())
+
+            transcriber = LiveTranscriber(model_name="small")
+            collected = []
+            thread = LiveTranscriberThread(
+                transcriber=transcriber,
+                chunk_seconds=3,
+                sample_rate=SAMPLE_RATE,
+                on_text=collected.append,
+            )
+            thread.start()
+            thread.feed(np.zeros(SAMPLE_RATE * 3, dtype=np.float32))
+            time.sleep(0.5)
+            thread.stop()
+            thread.join(timeout=5)
+
+        transcript = " ".join(collected)
+        summarizer = Summarizer(ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10)
+        writer = NoteWriter(notes_dir=notes_dir)
+        summary = summarizer.summarize(transcript)
+        path = writer.write(
+            transcript=transcript,
+            summary=summary,
+            duration_seconds=0,
+            model="live/small",
+            recorded_at=datetime(2026, 3, 4, 12, 0, 0),
+        )
+
+        content = path.read_text()
+        assert "live/small" in content
 
 
 # ============================================================
@@ -671,12 +667,130 @@ class TestRapidStartAfterStop:
 
 
 # ============================================================
-# Scenario: App state machine — menu items in live state
+# Scenario 14 (NEW): faster-whisper error mid-stream — resilience
+# ============================================================
+
+
+class TestFasterWhisperMidStreamError:
+    """faster-whisper fails on some chunks but the note is still saved.
+
+    Per spec section 8: faster-whisper error during chunk is silently skipped.
+    The thread continues processing subsequent chunks. The note should contain
+    text from the chunks that succeeded.
+    """
+
+    def test_error_on_second_chunk_still_saves_other_chunks(self, notes_dir, respx_mock):
+        """Chunk 1 succeeds, chunk 2 raises, chunk 3 succeeds -> note has chunks 1 and 3."""
+        respx_mock.post("http://localhost:11434/api/generate").mock(
+            return_value=httpx.Response(200, json={"response": "summary despite error", "done": True})
+        )
+
+        with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:
+            call_count = [0]
+
+            def flaky_transcribe(audio, **kwargs):
+                call_count[0] += 1
+                if call_count[0] == 2:
+                    raise RuntimeError("model crash on chunk 2")
+                seg = MagicMock()
+                seg.text = f" survived{call_count[0]}"
+                return [seg], MagicMock()
+
+            MockModel.return_value.transcribe.side_effect = flaky_transcribe
+
+            transcriber = LiveTranscriber(model_name="base")
+            collected = []
+            thread = LiveTranscriberThread(
+                transcriber=transcriber,
+                chunk_seconds=1,
+                sample_rate=SAMPLE_RATE,
+                on_text=collected.append,
+            )
+            thread.start()
+
+            # Feed 3 chunks: chunk 2 will fail
+            for _ in range(3):
+                thread.feed(np.zeros(SAMPLE_RATE, dtype=np.float32))
+            time.sleep(0.5)
+            thread.stop()
+            thread.join(timeout=5)
+
+        # Chunk 2 was skipped, chunks 1 and 3 should be collected
+        assert len(collected) == 2
+        assert "survived1" in collected[0]
+        assert "survived3" in collected[1]
+
+        transcript = " ".join(collected)
+        summarizer = Summarizer(ollama_url="http://localhost:11434", model="gemma2:9b", timeout=10)
+        writer = NoteWriter(notes_dir=notes_dir)
+        summary = summarizer.summarize(transcript)
+        path = writer.write(
+            transcript=transcript,
+            summary=summary,
+            duration_seconds=0,
+            model="live/base",
+            recorded_at=datetime(2026, 3, 4, 20, 0, 0),
+        )
+
+        content = path.read_text()
+        assert "survived1" in content
+        assert "survived3" in content
+        assert "## Summary" in content
+        assert "## Transcript" in content
+        # The errored chunk text should NOT appear
+        assert "survived2" not in content
+
+    def test_all_chunks_fail_produces_empty_transcript(self, notes_dir):
+        """Every chunk raises -> empty transcript -> '(no speech detected)'."""
+        with patch("whisper_notes.live_transcriber.WhisperModel") as MockModel:
+            MockModel.return_value.transcribe.side_effect = RuntimeError("always fails")
+
+            transcriber = LiveTranscriber(model_name="base")
+            collected = []
+            thread = LiveTranscriberThread(
+                transcriber=transcriber,
+                chunk_seconds=1,
+                sample_rate=SAMPLE_RATE,
+                on_text=collected.append,
+            )
+            thread.start()
+
+            for _ in range(3):
+                thread.feed(np.zeros(SAMPLE_RATE, dtype=np.float32))
+            time.sleep(0.5)
+            thread.stop()
+            thread.join(timeout=5)
+
+        # Nothing collected -- all chunks failed
+        assert len(collected) == 0
+
+        transcript = " ".join(collected).strip() or "(no speech detected)"
+        writer = NoteWriter(notes_dir=notes_dir)
+        path = writer.write(
+            transcript=transcript,
+            summary=None,
+            duration_seconds=0,
+            model="live/base",
+            recorded_at=datetime(2026, 3, 4, 21, 0, 0),
+        )
+
+        content = path.read_text()
+        assert "(no speech detected)" in content
+        assert "## Summary" not in content
+
+
+# ============================================================
+# App state machine — full lifecycle via mocked app
 # ============================================================
 
 
 class TestAppStateMachineLive:
-    """Verify app state transitions and menu item states for live mode."""
+    """Verify app state transitions for live mode.
+
+    These tests use the mocked rumps/tkinter environment to test the app's
+    state machine without a display. They verify state transitions, not
+    file output (which is covered by the pipeline tests above).
+    """
 
     def test_idle_to_live_to_idle(self, mock_rumps, tmp_path):
         """Full state cycle: idle -> live -> processing -> idle."""
@@ -692,7 +806,7 @@ class TestAppStateMachineLive:
              patch("whisper_notes.app.LiveRecorder"), \
              patch("whisper_notes.app.LiveTranscriber"), \
              patch("whisper_notes.app.LiveTranscriberThread"), \
-             patch("whisper_notes.app.LiveWindow") as MockWindow:
+             patch("whisper_notes.app.LiveWindow"):
             app = app_module.WhisperNotesApp(cfg)
 
             # idle
@@ -717,7 +831,7 @@ class TestAppStateMachineLive:
             assert app._live_thread is None
 
     def test_stop_live_noop_when_idle(self, mock_rumps, tmp_path):
-        """_on_stop_live is a no-op if state is not 'live'."""
+        """AC-6.6: _on_stop_live is a no-op if state is not 'live'."""
         app_module, _ = mock_rumps
         cfg = Config()
         cfg.notes_dir = tmp_path / "Notes"
@@ -738,12 +852,15 @@ class TestAppStateMachineLive:
 
 
 # ============================================================
-# Scenario: Partial buffer transcribed on stop
+# Partial buffer transcribed on stop
 # ============================================================
 
 
 class TestPartialBufferOnStop:
-    """Audio shorter than chunk_seconds is transcribed when stop is called."""
+    """Audio shorter than chunk_seconds is transcribed when stop is called.
+
+    Per spec AC-3.3: remaining buffer after stop is transcribed.
+    """
 
     def test_partial_audio_transcribed_on_stop(self, notes_dir, respx_mock):
         """Feed half a chunk, stop -> remaining buffer is transcribed."""

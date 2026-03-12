@@ -404,6 +404,11 @@ class QuillApp(rumps.App):
 
 
 def main():
+    # Force menu-bar-only mode (no Dock icon). Exec-ing into the Python
+    # framework binary loses the bundle's LSUIElement setting.
+    from AppKit import NSApplication
+    NSApplication.sharedApplication().setActivationPolicy_(1)
+
     config = Config()
     QuillApp(config).run()
 
